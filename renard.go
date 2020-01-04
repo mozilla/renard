@@ -28,8 +28,8 @@ type FileFormat uint
 
 // File formats are identified by a given constant
 const (
-	Zip FileFormat = 1 + iota // import go.mozilla.org/renard/zip
-	Mar                       // import go.mozilla.org/renard/mar
+	Zip FileFormat = 1 + iota // import go.mozilla.org/renard/fileformat/zip
+	Mar                       // import go.mozilla.org/renard/fileformat/mar
 )
 
 // SigningBlock is the block containing a signature
@@ -57,25 +57,18 @@ type CoseMultiSig struct {
 	Signatures []cose.Signature
 }
 
-// Message is a parsed version of a COSE_Sign structure
+// SignMessage is the document that contains signatures and timestamps
+// that protect a file. A user of the Renard scheme initializes a new
+// SignMessage, populates it, then inserts it into a file according to
+// its format. The raw representation of a SignMessage follows the
+// COSE_Sign specification from rfc8152.
 type SignMessage struct {
-
-	// Timestamps is an array of rfc3161 signed timestamps of the payload
-	Timestamps []Timestamp
-
-	// Hashes is a list of hashes of the signed data indexed by hash algorithm
-	Hashes map[crypto.Hash][]byte
-
-	isHashed bool
-
-	// CounterSignature is an optional signature that can be applied
-	// after the main signatures are issued to allow a 3rd party to add
-	// additional trust to a given artifact
+	Hashes           map[crypto.Hash][]byte // hashes of signable data indexed by hash algorithm
+	Timestamps       []Timestamp            // array of rfc3161 timestamps
+	Signatures       []Signature
 	CounterSignature CounterSignature
 
-	// Signatures is an array of signatures issued by an authority
-	Signatures []Signature
-
+	isHashed   bool
 	fileFormat FileFormat
 }
 
@@ -86,18 +79,30 @@ type Signature struct {
 	Signature []byte
 }
 
+// CounterSignature is an optional signature that can be applied
+// after the main signatures are issued to allow a 3rd party to add
+// additional trust to a given artifact
 type CounterSignature interface{}
 
+// NewSignMessage constructs an empty SignMessage
 func NewSignMessage() *SignMessage {
 	msg := new(SignMessage)
 	msg.Hashes = make(map[crypto.Hash][]byte)
 	return msg
 }
 
+// SetFileFormatTo tells the marshaller to use a specific file format
+// to insert and extract signature messages from files.
 func (msg *SignMessage) SetFileFormatTo(ff FileFormat) {
 	msg.fileFormat = ff
 }
 
+// TimestampFrom adds a rfc3161 signed timestamp retrieved an authority
+// to a SignMessage.
+//
+// You can use any compliant public authority, such as
+// http://timestamp.digicert.com or http://timestamp.comodoca.com/, as long
+// as their roots are trusted by the system.
 func (msg *SignMessage) TimestampFrom(server string) error {
 	ts, err := RequestTimestampFromTSA(server, msg.Hashes[crypto.SHA256], crypto.SHA256)
 	if err != nil {

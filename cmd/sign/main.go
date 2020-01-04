@@ -39,7 +39,6 @@ func main() {
 		panic(err)
 	}
 	for _, tsServer := range []string{
-		"http://timestamp.apple.com/ts01",
 		"http://timestamp.digicert.com/",
 		"http://timestamp.comodoca.com/",
 	} {

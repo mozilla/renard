@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"math/big"
@@ -17,17 +16,16 @@ import (
 	"go.mozilla.org/pkcs7"
 )
 
-// Timestamp represents an timestamp. See:
+// Timestamp represents a Signed Timestamp issued by a
+// TimeStamp Authority (TSA) according to
 // https://tools.ietf.org/html/rfc3161#section-2.4.1
 type Timestamp struct {
 	HashAlgorithm crypto.Hash
 	HashedMessage []byte
-
-	Time         time.Time
-	Accuracy     time.Duration
-	SerialNumber *big.Int
-
-	Certificates []x509.Certificate
+	Time          time.Time
+	Accuracy      time.Duration
+	SerialNumber  *big.Int
+	Certificates  []x509.Certificate
 
 	// Extensions contains raw X.509 extensions from the Extensions field of the
 	// timestamp. When parsing time-stamps, this can be used to extract
@@ -41,6 +39,9 @@ type Timestamp struct {
 	// be produced based on the other fields. The ExtraExtensions field is not
 	// populated when parsing timestamp responses, see Extensions.
 	ExtraExtensions []pkix.Extension
+
+	// Raw contains the original pkcs7 encoded timestamp as returned by the TSA
+	Raw []byte
 }
 
 // http://www.ietf.org/rfc/rfc3161.txt
@@ -72,7 +73,7 @@ type pkiStatusInfo struct {
 }
 
 // RequestTimestampFromTSA takes a TSA url and the bytes of a sha256 hash
-// and returns a signed timestamp and an error
+// and returns a signed timestamp and an error.
 func RequestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timestamp, error) {
 	// tsreq represents an timestamp request. See
 	// https://tools.ietf.org/html/rfc3161#section-2.4.1
@@ -132,8 +133,7 @@ func RequestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timest
 	if len(tsResp.TimeStampToken.FullBytes) == 0 {
 		return nil, fmt.Errorf("no pkcs7 data in timestamp response")
 	}
-	fmt.Printf("%s\n", base64.StdEncoding.EncodeToString(tsResp.TimeStampToken.FullBytes))
-	return UnmarshalTimestamp(tsResp.TimeStampToken.FullBytes)
+	return ParseAndVerifyTimestamp(tsResp.TimeStampToken.FullBytes)
 }
 
 // pkiFailureInfo contains the result of an timestamp request. See
@@ -142,64 +142,69 @@ type pkiFailureInfo int
 
 const (
 	// BadAlgorithm defines an unrecognized or unsupported Algorithm Identifier
-	BadAlgorithm pkiFailureInfo = 0
+	badAlgorithm pkiFailureInfo = 0
 	// BadRequest indicates that the transaction not permitted or supported
-	BadRequest pkiFailureInfo = 2
+	badRequest pkiFailureInfo = 2
 	// BadDataFormat means tha data submitted has the wrong format
-	BadDataFormat pkiFailureInfo = 5
+	badDataFormat pkiFailureInfo = 5
 	// TimeNotAvailable indicates that TSA's time source is not available
-	TimeNotAvailable pkiFailureInfo = 14
+	timeNotAvailable pkiFailureInfo = 14
 	// UnacceptedPolicy indicates that the requested TSA policy is not supported
 	// by the TSA
-	UnacceptedPolicy pkiFailureInfo = 15
+	unacceptedPolicy pkiFailureInfo = 15
 	// UnacceptedExtension indicates that the requested extension is not supported
 	// by the TSA
-	UnacceptedExtension pkiFailureInfo = 16
+	unacceptedExtension pkiFailureInfo = 16
 	// AddInfoNotAvailable means that the information requested could not be
 	// understood or is not available
-	AddInfoNotAvailable pkiFailureInfo = 17
+	addInfoNotAvailable pkiFailureInfo = 17
 	// SystemFailure indicates that the request cannot be handled due to system
 	// failure
-	SystemFailure pkiFailureInfo = 25
+	systemFailure pkiFailureInfo = 25
 )
 
 func (f pkiFailureInfo) String() string {
 	switch f {
-	case BadAlgorithm:
+	case badAlgorithm:
 		return "unrecognized or unsupported Algorithm Identifier"
-	case BadRequest:
+	case badRequest:
 		return "transaction not permitted or supported"
-	case BadDataFormat:
+	case badDataFormat:
 		return "the data submitted has the wrong format"
-	case TimeNotAvailable:
+	case timeNotAvailable:
 		return "the TSA's time source is not available"
-	case UnacceptedPolicy:
+	case unacceptedPolicy:
 		return "the requested TSA policy is not supported by the TSA"
-	case UnacceptedExtension:
+	case unacceptedExtension:
 		return "the requested extension is not supported by the TSA"
-	case AddInfoNotAvailable:
+	case addInfoNotAvailable:
 		return "the additional information requested could not be understood or is not available"
-	case SystemFailure:
+	case systemFailure:
 		return "the request cannot be handled due to system failure"
 	default:
 		return "unknown failure: " + strconv.Itoa(int(f))
 	}
 }
 
-// UnmarshalTimestamp parses an timestamp in DER form. If the time-stamp contains a
+// ParseAndVerifyTimestamp parses an timestamp in DER form. If the time-stamp contains a
 // certificate then the signature over the response is checked.
 //
 // Invalid signatures or parse failures will result in a fmt.Errorf. Error
 // responses will result in a ResponseError.
-func UnmarshalTimestamp(rawTs []byte) (*Timestamp, error) {
+func ParseAndVerifyTimestamp(rawTs []byte) (*Timestamp, error) {
 	var inf tstInfo
 	p7, err := pkcs7.Parse(rawTs)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(p7.Certificates) > 0 {
-		if err = p7.Verify(); err != nil {
+		// Verify the signature of the timestamp and the chain of certificate
+		// against the roots stored in the system truststore.
+		systemCertPool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, err
+		}
+		if err = p7.VerifyWithChain(systemCertPool); err != nil {
 			return nil, err
 		}
 	}
@@ -207,11 +212,9 @@ func UnmarshalTimestamp(rawTs []byte) (*Timestamp, error) {
 	if _, err = asn1.Unmarshal(p7.Content, &inf); err != nil {
 		return nil, err
 	}
-
 	if len(inf.MessageImprint.HashedMessage) == 0 {
 		return nil, fmt.Errorf("timestamp response contains no hashed message")
 	}
-
 	ret := &Timestamp{
 		HashedMessage: inf.MessageImprint.HashedMessage,
 		SerialNumber:  inf.SerialNumber,
@@ -220,6 +223,7 @@ func UnmarshalTimestamp(rawTs []byte) (*Timestamp, error) {
 			(time.Millisecond * time.Duration(inf.Accuracy.Milliseconds)) +
 			(time.Microsecond * time.Duration(inf.Accuracy.Microseconds))),
 		Extensions: inf.Extensions,
+		Raw:        rawTs,
 	}
 	for _, c := range p7.Certificates {
 		ret.Certificates = append(ret.Certificates, *c)
