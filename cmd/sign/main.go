@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"math/big"
@@ -18,7 +18,7 @@ import (
 
 func main() {
 	msg := renard.NewSignMessage()
-	msg.SetFileFormatTo(renard.Zip)
+	msg.SetFileFormat(renard.Zip)
 	input, err := ioutil.ReadFile(os.Args[1])
 	if err != nil {
 		panic(err)
@@ -27,41 +27,43 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	msg.CalculateHashes(signableInput)
-	signableInput = nil // free some memory
+	msg.SetPayload(signableInput)
 
-	eePriv, chain, err := makeCertChain()
-	if err != nil {
-		panic(err)
-	}
-	err = msg.Sign(eePriv, chain)
-	if err != nil {
-		panic(err)
+	// make 2 signatures
+	for i := 1; i < 2; i++ {
+		eePriv, chain, err := makeCertChain()
+		if err != nil {
+			panic(err)
+		}
+		err = msg.PrepareSignature(eePriv, chain)
+		if err != nil {
+			panic(err)
+		}
 	}
 	for _, tsServer := range []string{
 		"http://timestamp.digicert.com/",
 		"http://timestamp.comodoca.com/",
 	} {
-		err = msg.TimestampFrom(tsServer)
+		err = msg.AddTimestamp(tsServer)
 		if err != nil {
 			panic(err)
 		}
 	}
+	err = msg.Finalize()
+	if err != nil {
+		panic(err)
+	}
+	coseSig, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
 	/*
-		signedOutput, err := msg.Marshal(input)
-		if err != nil {
-			panic(err)
-		}
-		err = ioutil.WriteFile(os.Args[2], signedOutput, 0750)
+		jsonMsg, err := json.MarshalIndent(msg, "", "  ")
 		if err != nil {
 			panic(err)
 		}
 	*/
-	jsonMsg, err := json.MarshalIndent(msg, "", "  ")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("%s\n", jsonMsg)
+	fmt.Printf("%s\n", base64.StdEncoding.EncodeToString(coseSig))
 }
 
 func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []x509.Certificate, err error) {

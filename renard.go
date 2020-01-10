@@ -5,12 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 
 	"go.mozilla.org/cose"
 )
@@ -49,14 +48,6 @@ type SigningBlock struct {
 	Magic string
 }
 
-// CoseMultiSig is a COSE_Sign structure that follows
-// the “Multiple Signers” format from RFC 8152 section C.1.3.
-type CoseMultiSig struct {
-	Headers    *cose.Headers
-	Payload    []byte
-	Signatures []cose.Signature
-}
-
 // SignMessage is the document that contains signatures and timestamps
 // that protect a file. A user of the Renard scheme initializes a new
 // SignMessage, populates it, then inserts it into a file according to
@@ -65,18 +56,23 @@ type CoseMultiSig struct {
 type SignMessage struct {
 	Hashes           map[crypto.Hash][]byte // hashes of signable data indexed by hash algorithm
 	Timestamps       []Timestamp            // array of rfc3161 timestamps
+	Payload          []byte
 	Signatures       []Signature
 	CounterSignature CounterSignature
 
-	isHashed   bool
-	fileFormat FileFormat
+	coseMsg     *cose.SignMessage
+	isFinalized bool
+	fileFormat  FileFormat
+	rand        io.Reader // rand is a CSPRNG from crypto/rand (default) or set to a specific reader (like an hsm)
 }
 
 // A Signature is an authority-issued signature of the hash of the signed file
 type Signature struct {
-	Algorithm *cose.Algorithm
-	CertChain []x509.Certificate
-	Signature []byte
+	Algorithm          *cose.Algorithm
+	CertChain          []x509.Certificate
+	CoseSignatureBytes []byte
+	coseSig            *cose.Signature
+	signer             *cose.Signer
 }
 
 // CounterSignature is an optional signature that can be applied
@@ -88,25 +84,46 @@ type CounterSignature interface{}
 func NewSignMessage() *SignMessage {
 	msg := new(SignMessage)
 	msg.Hashes = make(map[crypto.Hash][]byte)
+	msg.rand = rand.Reader
 	return msg
 }
 
-// SetFileFormatTo tells the marshaller to use a specific file format
+// SetFileFormat tells the marshaller to use a specific file format
 // to insert and extract signature messages from files.
-func (msg *SignMessage) SetFileFormatTo(ff FileFormat) {
+func (msg *SignMessage) SetFileFormat(ff FileFormat) {
 	msg.fileFormat = ff
 }
 
-// TimestampFrom adds a rfc3161 signed timestamp retrieved an authority
+// SetRng configures the signers to use a different
+// random number generator than the default from crypto/rand
+func (msg *SignMessage) SetRng(rng io.Reader) {
+	msg.rand = rng
+}
+
+// SetPayload sets the payload of the sign message. Later on, finalization will hash this
+// payload alongside the protected headers and other metadata, then sign the results.
+// The Payload is normally set to the signed sections of a file.
+func (msg *SignMessage) SetPayload(payload []byte) {
+	msg.Payload = payload
+}
+
+// AddTimestamp adds a rfc3161 signed timestamp retrieved an authority
 // to a SignMessage.
 //
 // You can use any compliant public authority, such as
 // http://timestamp.digicert.com or http://timestamp.comodoca.com/, as long
 // as their roots are trusted by the system.
-func (msg *SignMessage) TimestampFrom(server string) error {
-	ts, err := RequestTimestampFromTSA(server, msg.Hashes[crypto.SHA256], crypto.SHA256)
+func (msg *SignMessage) AddTimestamp(server string) error {
+	if msg.isFinalized {
+		return errors.New("message is already finalized, adding timestamps is not possible as it breaks signatures")
+	}
+	if msg.Payload == nil {
+		return errors.New("message payload is not set")
+	}
+	h256 := sha256.Sum256(msg.Payload)
+	ts, err := RequestTimestampFromTSA(server, h256[:], crypto.SHA256)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to request timestamp from tsa: %w", err)
 	}
 	msg.Timestamps = append(msg.Timestamps, *ts)
 	return nil
@@ -122,35 +139,22 @@ func ExtractSignedSections(input []byte) (output []byte, err error) {
 	return input, nil
 }
 
-// CalculateHashes takes a signable input and calculates various hashes
-// that get stored in the message structure to later reuse them in signing
-func (msg *SignMessage) CalculateHashes(input []byte) {
-	h1 := sha1.Sum(input)
-	msg.Hashes[crypto.SHA1] = h1[:]
-
-	h256 := sha256.Sum256(input)
-	msg.Hashes[crypto.SHA256] = h256[:]
-
-	h384 := sha512.Sum384(input)
-	msg.Hashes[crypto.SHA384] = h384[:]
-
-	msg.isHashed = true
-}
-
-// Sign takes a private key and chain of certificates (ordered from end-entity to root)
-// and uses the private key to sign the hash of an signable input previously computed.
-// It then adds a Signature to the SignMessage with the computed signature and cert chain.
+// PrepareSignature takes a private key and chain of certificates (ordered from end-entity to root)
+// and prepares a signature that will sign the message when finalized.
 //
 // The signing algorithm is determined by the key type. RSA keys get PS256, ECDSA
 // keys get ES256 for P-256 and ES384 for P-384. No other curves are supported.
-func (msg *SignMessage) Sign(signer crypto.Signer, chain []x509.Certificate) error {
-	if !msg.isHashed {
-		return errors.New("input hashes must be calculated prior to signing")
+func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []x509.Certificate) (err error) {
+	if msg.isFinalized {
+		return errors.New("message is already finalized, adding signers is not permitted")
 	}
-	var (
-		sig Signature
-		err error
-	)
+	if msg.Payload == nil {
+		return errors.New("message payload is not set")
+	}
+	var sig Signature
+	sig.coseSig = cose.NewSignature()
+
+	// find out the cose algorithm based on the priv key type
 	switch signer.Public().(type) {
 	case *rsa.PublicKey:
 		sig.Algorithm = cose.PS256
@@ -166,13 +170,21 @@ func (msg *SignMessage) Sign(signer crypto.Signer, chain []x509.Certificate) err
 	default:
 		return fmt.Errorf("unsupported key type %t", signer.Public())
 	}
+	sig.coseSig.Headers.Protected["alg"] = sig.Algorithm.Name
+
+	// make sure the certificate chain is properly constructed,
+	// then store its DER version in the cose signature headers
 	err = validateCertChain(chain)
 	if err != nil {
 		return err
 	}
-	sig.CertChain = chain
+	var derChain [][]byte
+	for _, cert := range chain {
+		derChain = append(derChain, cert.Raw[:])
+	}
+	sig.coseSig.Headers.Protected["kid"] = derChain
 
-	sig.Signature, err = signer.Sign(rand.Reader, msg.Hashes[crypto.SHA256], nil)
+	sig.signer, err = cose.NewSignerFromKey(sig.Algorithm, signer.(crypto.PrivateKey))
 	if err != nil {
 		return err
 	}
@@ -209,4 +221,43 @@ func validateCertChain(chain []x509.Certificate) error {
 		return fmt.Errorf("failed to verify end-entity chain to root: %w", err)
 	}
 	return nil
+}
+
+// Finalize signs a message with all the configured cose signers and makes
+// it ready for marshalling and insertion into the destination file.
+//
+// A finalized message can no longer be modified, except for counter signatures.
+func (msg *SignMessage) Finalize() (err error) {
+	if msg.isFinalized {
+		return fmt.Errorf("cannot finalize a message that's already finalized")
+	}
+	// we need to construct a cose.SignMessage from al the data we have in
+	// our SignMessage. First we copy the payload, then the signatures, then
+	// the signers. The signers need to map to the signatures 1:1, but in 2
+	// separate slices.
+	var signers []cose.Signer
+	msg.coseMsg = cose.NewSignMessage()
+	msg.coseMsg.Payload = msg.Payload
+	for _, sig := range msg.Signatures {
+		msg.coseMsg.AddSignature(sig.coseSig)
+		signers = append(signers, *sig.signer)
+	}
+	err = msg.coseMsg.Sign(msg.rand, nil, signers)
+	if err != nil {
+		return fmt.Errorf("failed to sign final message: %w", err)
+	}
+	// the signature is detached so the payload is always empty
+	msg.coseMsg.Payload = nil
+	msg.isFinalized = true
+	return nil
+}
+
+// Marshal encodes a finalized SignMessage into a COSE_Sign object
+// compliant with https://tools.ietf.org/html/rfc8152#section-4.1
+func (msg *SignMessage) Marshal() (coseSign []byte, err error) {
+	// preconditions
+	if !msg.isFinalized {
+		return nil, errors.New("message must be finalized before marshalling")
+	}
+	return cose.Marshal(msg.coseMsg)
 }
