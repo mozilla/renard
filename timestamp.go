@@ -72,9 +72,9 @@ type pkiStatusInfo struct {
 	FailInfo     int    `asn1:"optional"`
 }
 
-// RequestTimestampFromTSA takes a TSA url and the bytes of a sha256 hash
+// requestTimestampFromTSA takes a TSA url and the bytes of a sha256 hash
 // and returns a signed timestamp and an error.
-func RequestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timestamp, error) {
+func requestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timestamp, error) {
 	// tsreq represents an timestamp request. See
 	// https://tools.ietf.org/html/rfc3161#section-2.4.1
 	tsreq, err := asn1.Marshal(timeStampReq{
@@ -133,7 +133,7 @@ func RequestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timest
 	if len(tsResp.TimeStampToken.FullBytes) == 0 {
 		return nil, fmt.Errorf("no pkcs7 data in timestamp response")
 	}
-	return ParseAndVerifyTimestamp(tsResp.TimeStampToken.FullBytes)
+	return parseAndVerifyTimestamp(tsResp.TimeStampToken.FullBytes)
 }
 
 // pkiFailureInfo contains the result of an timestamp request. See
@@ -186,12 +186,12 @@ func (f pkiFailureInfo) String() string {
 	}
 }
 
-// ParseAndVerifyTimestamp parses an timestamp in DER form. If the time-stamp contains a
+// parseAndVerifyTimestamp parses an timestamp in DER form. If the time-stamp contains a
 // certificate then the signature over the response is checked.
 //
 // Invalid signatures or parse failures will result in a fmt.Errorf. Error
 // responses will result in a ResponseError.
-func ParseAndVerifyTimestamp(rawTs []byte) (*Timestamp, error) {
+func parseAndVerifyTimestamp(rawTs []byte) (*Timestamp, error) {
 	var inf tstInfo
 	p7, err := pkcs7.Parse(rawTs)
 	if err != nil {

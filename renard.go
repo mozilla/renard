@@ -1,3 +1,26 @@
+/*Package renard implements the RENARD signature scheme
+
+Renard (RNR) is a signature scheme designed to provide strong integrity
+guarantees on files. It is based on COSE and developed for Firefox add-ons
+(web extensions) and updates.
+
+The binary representation of an RNR signature is a COSE_Sign structure
+stored in a signing block inserted in the ZIP or MAR envelope of a file,
+immediately before the Central Directory section (similar to Android’s APKv2).
+This method allows clients to verify signatures with minimal parsing of the
+archive, while retaining a valid archive that can be decompressed using standard tools.
+
+A signer receives an unsigned XPI archive, inserts needed metadata inside the
+archive, then signs the SHA256 hash of the outer ZIP envelope using P-256.
+The signature block is stored in a COSE document and inserted in the outer ZIP envelope.
+
+A verifier receives a signed XPI archive, extracts the signature block from the ZIP,
+calculates the SHA256 hash of the outer ZIP envelope (excluding the signature block)
+and verifies the signature using the public key of the end-entity certificate stored
+in the COSE document. The verifier then checks the certificate chain, signed timestamp,
+and root against a local value.
+
+*/
 package renard // import "go.mozilla.org/renard"
 
 import (
@@ -20,6 +43,8 @@ const (
 
 	// ZipSig is the zip signature “RNR1” in little-endian
 	ZipSig = "\x4e\x52\x31\x52"
+
+	coseTimestampHeaderLabel = 75
 )
 
 // FileFormat identifies a supported input file format
@@ -121,7 +146,7 @@ func (msg *SignMessage) AddTimestamp(server string) error {
 		return errors.New("message payload is not set")
 	}
 	h256 := sha256.Sum256(msg.Payload)
-	ts, err := RequestTimestampFromTSA(server, h256[:], crypto.SHA256)
+	ts, err := requestTimestampFromTSA(server, h256[:], crypto.SHA256)
 	if err != nil {
 		return fmt.Errorf("failed to request timestamp from tsa: %w", err)
 	}
@@ -231,6 +256,7 @@ func (msg *SignMessage) Finalize() (err error) {
 	if msg.isFinalized {
 		return fmt.Errorf("cannot finalize a message that's already finalized")
 	}
+
 	// we need to construct a cose.SignMessage from al the data we have in
 	// our SignMessage. First we copy the payload, then the signatures, then
 	// the signers. The signers need to map to the signatures 1:1, but in 2
@@ -242,10 +268,21 @@ func (msg *SignMessage) Finalize() (err error) {
 		msg.coseMsg.AddSignature(sig.coseSig)
 		signers = append(signers, *sig.signer)
 	}
+
+	// add the timestamps to the top-level headers of the cose signmessage
+	if len(msg.Timestamps) > 0 {
+		var timestamps [][]byte
+		for _, ts := range msg.Timestamps {
+			timestamps = append(timestamps, ts.Raw)
+		}
+		msg.coseMsg.Headers.Protected[coseTimestampHeaderLabel] = timestamps
+	}
+
 	err = msg.coseMsg.Sign(msg.rand, nil, signers)
 	if err != nil {
 		return fmt.Errorf("failed to sign final message: %w", err)
 	}
+
 	// the signature is detached so the payload is always empty
 	msg.coseMsg.Payload = nil
 	msg.isFinalized = true
@@ -260,4 +297,36 @@ func (msg *SignMessage) Marshal() (coseSign []byte, err error) {
 		return nil, errors.New("message must be finalized before marshalling")
 	}
 	return cose.Marshal(msg.coseMsg)
+}
+
+// Unmarshal parses a binary cose signature into a renard sign message.
+func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
+	msg = NewSignMessage()
+	parsedMsg, err := cose.Unmarshal(coseMsg)
+	if err != nil {
+		return msg, fmt.Errorf("failed to unmarshal cose message: %w", err)
+	}
+	cMsg := parsedMsg.(cose.SignMessage)
+	msg.coseMsg = &cMsg
+
+	// Parse the timestamps
+	if timestamps, ok := msg.coseMsg.Headers.Protected[coseTimestampHeaderLabel]; ok {
+		tsArray, ok := timestamps.([]interface{})
+		if !ok {
+			return msg, fmt.Errorf("failed to decode timestamps as an array")
+		}
+		for i, timestamp := range tsArray {
+			tsBytes, ok := timestamp.([]byte)
+			if !ok {
+				return msg, fmt.Errorf("failed to decode %d timestamp as a byte sequence", i)
+			}
+			// timestamp header found, parse them
+			parsedTs, err := parseAndVerifyTimestamp(tsBytes)
+			if err != nil {
+				return msg, fmt.Errorf("failed to parse timestamps: %w", err)
+			}
+			msg.Timestamps = append(msg.Timestamps, *parsedTs)
+		}
+	}
+	return
 }

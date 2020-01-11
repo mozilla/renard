@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"math/big"
@@ -30,7 +29,8 @@ func main() {
 	msg.SetPayload(signableInput)
 
 	// make 2 signatures
-	for i := 1; i < 2; i++ {
+	for i := 1; i <= 2; i++ {
+		fmt.Printf("-- preparing signature %d\n", i)
 		eePriv, chain, err := makeCertChain()
 		if err != nil {
 			panic(err)
@@ -40,15 +40,17 @@ func main() {
 			panic(err)
 		}
 	}
-	for _, tsServer := range []string{
+	for i, tsServer := range []string{
 		"http://timestamp.digicert.com/",
 		"http://timestamp.comodoca.com/",
 	} {
+		fmt.Printf("-- requesting timestamp %d from %q\n", i, tsServer)
 		err = msg.AddTimestamp(tsServer)
 		if err != nil {
 			panic(err)
 		}
 	}
+	fmt.Printf("-- finalizing\n")
 	err = msg.Finalize()
 	if err != nil {
 		panic(err)
@@ -63,7 +65,15 @@ func main() {
 			panic(err)
 		}
 	*/
-	fmt.Printf("%s\n", base64.StdEncoding.EncodeToString(coseSig))
+
+	fmt.Println("-- unmarshalling")
+	parsedMsg, err := renard.Unmarshal(coseSig)
+	if err != nil {
+		panic(err)
+	}
+	for i, ts := range parsedMsg.Timestamps {
+		fmt.Printf("-- found timestamp %d from %q\n", i, ts.Certificates[0].Issuer.CommonName)
+	}
 }
 
 func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []x509.Certificate, err error) {
