@@ -459,3 +459,14 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 	}
 	return nil
 }
+
+// Verify handles the entire timestamp and signature verification logic. It first calls
+// VerifyTimestamp and passes it the timestampTrustStore, then calls VerifySignatures and
+// passes it the signaturesTrustStore.
+func (msg *SignMessage) Verify(timestampTrustStore, signaturesTrustStore *x509.CertPool) error {
+	err := msg.VerifyTimestamps(timestampTrustStore)
+	if err != nil {
+		return err
+	}
+	return msg.VerifySignatures(signaturesTrustStore)
+}
