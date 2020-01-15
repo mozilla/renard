@@ -50,22 +50,29 @@ func main() {
 			panic(err)
 		}
 	}
-	fmt.Printf("-- finalizing\n")
+	fmt.Printf("-- signing and finalizing\n")
 	err = msg.Finalize()
 	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("-- marshalling\n")
 	coseSig, err := msg.Marshal()
 	if err != nil {
 		panic(err)
 	}
-	/*
-		jsonMsg, err := json.MarshalIndent(msg, "", "  ")
-		if err != nil {
-			panic(err)
-		}
-	*/
+	tmpfile, err := ioutil.TempFile("", "coseSig")
+	if err != nil {
+		panic(err)
+	}
+	if _, err := tmpfile.Write(coseSig); err != nil {
+		panic(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		panic(err)
+	}
+	fmt.Printf("-- done. cose signature of len %d bytes written to %s\n", len(coseSig), tmpfile.Name())
 
+	// Parse the cose message and verify timestamps and signatures
 	fmt.Println("-- unmarshalling")
 	parsedMsg, err := renard.Unmarshal(coseSig)
 	if err != nil {
@@ -74,9 +81,27 @@ func main() {
 	for i, ts := range parsedMsg.Timestamps {
 		fmt.Printf("-- found timestamp %d from %q\n", i, ts.Certificates[0].Issuer.CommonName)
 	}
+	for i, sig := range parsedMsg.Signatures {
+		for j, cert := range sig.CertChain {
+			fmt.Printf("-- signature %d certificate %d %s\n", i, j, cert.Subject.CommonName)
+		}
+	}
+	parsedMsg.SetPayload(signableInput)
+
+	// Verify the signature of the timestamp and the chain of certificate
+	// against the roots stored in the system truststore.
+	systemCertPool, err := x509.SystemCertPool()
+	if err != nil {
+		panic(err)
+	}
+	err = parsedMsg.VerifyTimestamps(systemCertPool)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("-- timestamps verified")
 }
 
-func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []x509.Certificate, err error) {
+func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []*x509.Certificate, err error) {
 	rootKeyName := []byte(fmt.Sprintf("root%d", time.Now().Unix()))
 	rootPriv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
@@ -146,6 +171,6 @@ func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []x509.Certificate, err
 	if err != nil {
 		return
 	}
-	chain = []x509.Certificate{*rootCert, *interCert, *eeCert}
+	chain = []*x509.Certificate{rootCert, interCert, eeCert}
 	return
 }

@@ -133,7 +133,7 @@ func requestTimestampFromTSA(server string, h []byte, hAlg crypto.Hash) (*Timest
 	if len(tsResp.TimeStampToken.FullBytes) == 0 {
 		return nil, fmt.Errorf("no pkcs7 data in timestamp response")
 	}
-	return parseAndVerifyTimestamp(tsResp.TimeStampToken.FullBytes)
+	return parseTimestamp(tsResp.TimeStampToken.FullBytes)
 }
 
 // pkiFailureInfo contains the result of an timestamp request. See
@@ -186,29 +186,13 @@ func (f pkiFailureInfo) String() string {
 	}
 }
 
-// parseAndVerifyTimestamp parses an timestamp in DER form. If the time-stamp contains a
-// certificate then the signature over the response is checked.
-//
-// Invalid signatures or parse failures will result in a fmt.Errorf. Error
-// responses will result in a ResponseError.
-func parseAndVerifyTimestamp(rawTs []byte) (*Timestamp, error) {
+// parseTimestamp parses an timestamp in DER form into a Timestamp struct
+func parseTimestamp(rawTs []byte) (*Timestamp, error) {
 	var inf tstInfo
 	p7, err := pkcs7.Parse(rawTs)
 	if err != nil {
 		return nil, err
 	}
-	if len(p7.Certificates) > 0 {
-		// Verify the signature of the timestamp and the chain of certificate
-		// against the roots stored in the system truststore.
-		systemCertPool, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, err
-		}
-		if err = p7.VerifyWithChain(systemCertPool); err != nil {
-			return nil, err
-		}
-	}
-
 	if _, err = asn1.Unmarshal(p7.Content, &inf); err != nil {
 		return nil, err
 	}
@@ -233,6 +217,34 @@ func parseAndVerifyTimestamp(rawTs []byte) (*Timestamp, error) {
 		return nil, err
 	}
 	return ret, nil
+}
+
+// verifyTimestamp parses an timestamp in DER form, verify its signature,
+// its certificate chain, and that the payloadHash it applies to matches
+// the provided payload (typically a sha256 hash of the original file).
+func verifyTimestamp(rawTs, payloadHash []byte, certpool *x509.CertPool) error {
+	var inf tstInfo
+	p7, err := pkcs7.Parse(rawTs)
+	if err != nil {
+		return fmt.Errorf("failed to parse timestamp pkcs7 envelope: %w", err)
+	}
+	if len(p7.Certificates) == 0 {
+		return fmt.Errorf("no certificate was found in the timestamp, cannot verify signature")
+	}
+	if err = p7.VerifyWithChain(certpool); err != nil {
+		return fmt.Errorf("failed to verify certificate chain using system truststore: %w", err)
+	}
+
+	if _, err = asn1.Unmarshal(p7.Content, &inf); err != nil {
+		return fmt.Errorf("failed to unmarshal timestamp's asn1 tstinfo: %w", err)
+	}
+	if len(inf.MessageImprint.HashedMessage) == 0 {
+		return fmt.Errorf("timestamp response contains no hashed message")
+	}
+	if !bytes.Equal(inf.MessageImprint.HashedMessage, payloadHash) {
+		return fmt.Errorf("timestamp's hashes message %x doesn't match expected hash %x", inf.MessageImprint.HashedMessage, payloadHash)
+	}
+	return nil
 }
 
 type tstInfo struct {

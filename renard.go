@@ -8,17 +8,20 @@ The binary representation of an RNR signature is a COSE_Sign structure
 stored in a signing block inserted in the ZIP or MAR envelope of a file,
 immediately before the Central Directory section (similar to Android’s APKv2).
 This method allows clients to verify signatures with minimal parsing of the
-archive, while retaining a valid archive that can be decompressed using standard tools.
+archive, while retaining a valid archive that can be decompressed using
+standard tools.
 
-A signer receives an unsigned XPI archive, inserts needed metadata inside the
-archive, then signs the SHA256 hash of the outer ZIP envelope using P-256.
-The signature block is stored in a COSE document and inserted in the outer ZIP envelope.
+A signer receives an unsigned file, inserts needed metadata inside the
+file, then signs the SHA256 hash of the outer envelope using P-256.
+The signature block is stored in a COSE document and inserted in the
+outer envelope.
 
-A verifier receives a signed XPI archive, extracts the signature block from the ZIP,
-calculates the SHA256 hash of the outer ZIP envelope (excluding the signature block)
-and verifies the signature using the public key of the end-entity certificate stored
-in the COSE document. The verifier then checks the certificate chain, signed timestamp,
-and root against a local value.
+A verifier receives a signed file, extracts the signature block from the
+file, calculates the SHA256 hash of the outer envelope (excluding the
+signature block) and verifies the signature using the public key of the
+end-entity certificate stored in the COSE document. The verifier then
+checks the certificate chain, signed timestamp, and root against a local
+truststore.
 
 */
 package renard // import "go.mozilla.org/renard"
@@ -93,11 +96,10 @@ type SignMessage struct {
 
 // A Signature is an authority-issued signature of the hash of the signed file
 type Signature struct {
-	Algorithm          *cose.Algorithm
-	CertChain          []x509.Certificate
-	CoseSignatureBytes []byte
-	coseSig            *cose.Signature
-	signer             *cose.Signer
+	Algorithm *cose.Algorithm
+	CertChain []*x509.Certificate
+	coseSig   *cose.Signature
+	signer    *cose.Signer
 }
 
 // CounterSignature is an optional signature that can be applied
@@ -169,7 +171,7 @@ func ExtractSignedSections(input []byte) (output []byte, err error) {
 //
 // The signing algorithm is determined by the key type. RSA keys get PS256, ECDSA
 // keys get ES256 for P-256 and ES384 for P-384. No other curves are supported.
-func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []x509.Certificate) (err error) {
+func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Certificate) (err error) {
 	if msg.isFinalized {
 		return errors.New("message is already finalized, adding signers is not permitted")
 	}
@@ -217,7 +219,7 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []x509.Cert
 	return nil
 }
 
-func validateCertChain(chain []x509.Certificate) error {
+func validateCertChain(chain []*x509.Certificate) error {
 	if len(chain) < 1 {
 		return errors.New("invalid empty certificate chain")
 	}
@@ -227,7 +229,7 @@ func validateCertChain(chain []x509.Certificate) error {
 	}
 	roots := x509.NewCertPool()
 	inters := x509.NewCertPool()
-	roots.AddCert(&chain[0])
+	roots.AddCert(chain[0])
 	opts := x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: inters,
@@ -237,7 +239,7 @@ func validateCertChain(chain []x509.Certificate) error {
 		// for chains greater than 2, add all intermediates to
 		// the intermediate certpool in the verify options
 		for i := 1; i < len(chain)-1; i++ {
-			opts.Intermediates.AddCert(&chain[i])
+			opts.Intermediates.AddCert(chain[i])
 		}
 	}
 	// now verify the end-entity
@@ -302,6 +304,7 @@ func (msg *SignMessage) Marshal() (coseSign []byte, err error) {
 // Unmarshal parses a binary cose signature into a renard sign message.
 func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
 	msg = NewSignMessage()
+	msg.isFinalized = true
 	parsedMsg, err := cose.Unmarshal(coseMsg)
 	if err != nil {
 		return msg, fmt.Errorf("failed to unmarshal cose message: %w", err)
@@ -321,12 +324,75 @@ func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
 				return msg, fmt.Errorf("failed to decode %d timestamp as a byte sequence", i)
 			}
 			// timestamp header found, parse them
-			parsedTs, err := parseAndVerifyTimestamp(tsBytes)
+			parsedTs, err := parseTimestamp(tsBytes)
 			if err != nil {
 				return msg, fmt.Errorf("failed to parse timestamps: %w", err)
 			}
 			msg.Timestamps = append(msg.Timestamps, *parsedTs)
 		}
 	}
+
+	// Parse the signatures
+	for i, coseSig := range msg.coseMsg.Signatures {
+		var sig Signature
+		algValue, ok := coseSig.Headers.Protected[cose.GetCommonHeaderTagOrPanic("alg")]
+		if !ok {
+			return msg, fmt.Errorf("missing 'alg' protected header in cose signature %d, cannot determine signing algorithm", i)
+		}
+		if _, ok = algValue.(int); !ok {
+			return msg, fmt.Errorf("in signature %d, 'alg' protected header is invalid, cannot determine signing algorithm", i)
+		}
+		switch algValue {
+		case cose.PS256.Value:
+			sig.Algorithm = cose.PS256
+		case cose.ES256.Value:
+			sig.Algorithm = cose.ES256
+		case cose.ES384.Value:
+			sig.Algorithm = cose.ES384
+		default:
+			return msg, fmt.Errorf("in signature %d, 'alg' header value %d doesn't match any known algorithm", i, algValue)
+		}
+		derCerts, ok := coseSig.Headers.Protected[cose.GetCommonHeaderTagOrPanic("kid")]
+		if !ok {
+			return msg, fmt.Errorf("missing 'kid' protected header in cose signature %d, cannot access certificate chain", i)
+		}
+		if _, ok = derCerts.([]interface{}); !ok {
+			return msg, fmt.Errorf("in signature %d, 'kid' protected header is not an []byte, cannot extract certificate chain", i)
+		}
+		var derChain []byte
+		for j, cert := range derCerts.([]interface{}) {
+			derCert, ok := cert.([]byte)
+			if !ok {
+				return msg, fmt.Errorf("in signature %d, certificate %d is not in DER form", i, j)
+			}
+			derChain = append(derChain, derCert...)
+		}
+		sig.CertChain, err = x509.ParseCertificates(derChain)
+		if err != nil {
+			return msg, fmt.Errorf("in signature %d, failed to parse DER certificate chain: %w", i, err)
+		}
+		sig.coseSig = &coseSig
+		msg.Signatures = append(msg.Signatures, sig)
+	}
 	return
+}
+
+// VerifyTimestamps verify all the signed timestamps stored in a SignMessage
+// by chaining their certs to a truststore in argument, and verifying the
+// hash of the message payload matches the hash message in the timestamp.
+func (msg *SignMessage) VerifyTimestamps(certpool *x509.CertPool) error {
+	if !msg.isFinalized {
+		return errors.New("message is not finalized, cannot verify timestamps")
+	}
+	if msg.Payload == nil {
+		return errors.New("message payload is not set, cannot verify timestamps")
+	}
+	h256 := sha256.Sum256(msg.Payload)
+	for i, ts := range msg.Timestamps {
+		err := verifyTimestamp(ts.Raw, h256[:], certpool)
+		if err != nil {
+			return fmt.Errorf("timestamp %d failed verification: %w", i, err)
+		}
+	}
+	return nil
 }
