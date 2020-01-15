@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"go.mozilla.org/cose"
 )
@@ -47,7 +48,8 @@ const (
 	// ZipSig is the zip signature “RNR1” in little-endian
 	ZipSig = "\x4e\x52\x31\x52"
 
-	coseTimestampHeaderLabel = 75
+	coseTimestampHeaderLabel = "timestamps"
+	coseX5ChainHeaderLabel   = "x5chain"
 )
 
 // FileFormat identifies a supported input file format
@@ -169,6 +171,9 @@ func ExtractSignedSections(input []byte) (output []byte, err error) {
 // PrepareSignature takes a private key and chain of certificates (ordered from end-entity to root)
 // and prepares a signature that will sign the message when finalized.
 //
+// While this function takes a full chain, for verification purpose, the root certificate
+// is not included in the final signature and is assumed to be known to verifiers.
+//
 // The signing algorithm is determined by the key type. RSA keys get PS256, ECDSA
 // keys get ES256 for P-256 and ES384 for P-384. No other curves are supported.
 func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Certificate) (err error) {
@@ -200,16 +205,16 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Cer
 	sig.coseSig.Headers.Protected["alg"] = sig.Algorithm.Name
 
 	// make sure the certificate chain is properly constructed,
-	// then store its DER version in the cose signature headers
 	err = validateCertChain(chain)
 	if err != nil {
 		return err
 	}
+	// then store each cert DER except the root into an array
 	var derChain [][]byte
-	for _, cert := range chain {
-		derChain = append(derChain, cert.Raw[:])
+	for i := 0; i < len(chain)-1; i++ {
+		derChain = append(derChain, chain[i].Raw[:])
 	}
-	sig.coseSig.Headers.Protected["kid"] = derChain
+	sig.coseSig.Headers.Protected[coseX5ChainHeaderLabel] = derChain
 
 	sig.signer, err = cose.NewSignerFromKey(sig.Algorithm, signer.(crypto.PrivateKey))
 	if err != nil {
@@ -220,16 +225,13 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Cer
 }
 
 func validateCertChain(chain []*x509.Certificate) error {
-	if len(chain) < 1 {
-		return errors.New("invalid empty certificate chain")
-	}
-	if len(chain) == 1 {
-		// no chain to verify when there's only one cert
-		return nil
+	if len(chain) < 2 {
+		return errors.New("certificate chain cannot have less than 2 certificates (an end-entity and a root)")
 	}
 	roots := x509.NewCertPool()
 	inters := x509.NewCertPool()
-	roots.AddCert(chain[0])
+	// the last cert in the chain must be the root
+	roots.AddCert(chain[len(chain)-1])
 	opts := x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: inters,
@@ -242,8 +244,9 @@ func validateCertChain(chain []*x509.Certificate) error {
 			opts.Intermediates.AddCert(chain[i])
 		}
 	}
-	// now verify the end-entity
-	_, err := chain[len(chain)-1].Verify(opts)
+	// now verify the chain starting at the end-entity,
+	// which must be the first cert
+	_, err := chain[0].Verify(opts)
 	if err != nil {
 		return fmt.Errorf("failed to verify end-entity chain to root: %w", err)
 	}
@@ -352,12 +355,12 @@ func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
 		default:
 			return msg, fmt.Errorf("in signature %d, 'alg' header value %d doesn't match any known algorithm", i, algValue)
 		}
-		derCerts, ok := coseSig.Headers.Protected[cose.GetCommonHeaderTagOrPanic("kid")]
+		derCerts, ok := coseSig.Headers.Protected[coseX5ChainHeaderLabel]
 		if !ok {
-			return msg, fmt.Errorf("missing 'kid' protected header in cose signature %d, cannot access certificate chain", i)
+			return msg, fmt.Errorf("missing 'x5chain' protected header in cose signature %d, cannot access certificate chain", i)
 		}
 		if _, ok = derCerts.([]interface{}); !ok {
-			return msg, fmt.Errorf("in signature %d, 'kid' protected header is not an []byte, cannot extract certificate chain", i)
+			return msg, fmt.Errorf("in signature %d, 'x5chain' protected header is not an array, cannot extract certificate chain", i)
 		}
 		var derChain []byte
 		for j, cert := range derCerts.([]interface{}) {
@@ -393,6 +396,66 @@ func (msg *SignMessage) VerifyTimestamps(certpool *x509.CertPool) error {
 		if err != nil {
 			return fmt.Errorf("timestamp %d failed verification: %w", i, err)
 		}
+	}
+	return nil
+}
+
+// VerifySignatures verifies each of the signatures stored in a SignMessage
+// and makes sure the certificates chain to roots in the provided truststore.
+//
+// Certificate expiration is checked based on the time of issuance of the
+// first signed timestamp listed in the SignMessage, not based on the current
+// time. In practice, it means signatures are considered valid as long as
+// certificates were valid at the time of issuance of the signature.
+//
+// If no timestamps are available, certificate expiration is evaluated on
+// current time.
+func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
+	if !msg.isFinalized {
+		return errors.New("message is not finalized, cannot verify signatures")
+	}
+	if msg.Payload == nil {
+		return errors.New("message payload is not set, cannot verify signatures")
+	}
+	var verifiers = []cose.Verifier{}
+
+	// First verify the certificate chains on each of the signatures, and while
+	// doing so, store the public key of each end-entity into a list of verifiers
+	verificationTime := time.Now()
+	if len(msg.Timestamps) > 0 {
+		verificationTime = msg.Timestamps[0].Time
+	}
+	for i, sig := range msg.Signatures {
+		inters := x509.NewCertPool()
+		opts := x509.VerifyOptions{
+			Roots:         localRoots,
+			Intermediates: inters,
+			CurrentTime:   verificationTime,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+		}
+		if len(sig.CertChain) > 1 {
+			// for chains greater than 1, add all intermediates to
+			// the intermediate certpool in the verify options
+			for i := 1; i < len(sig.CertChain); i++ {
+				opts.Intermediates.AddCert(sig.CertChain[i])
+			}
+		}
+		// the first cert is the end-entity, start there to verify the chain
+		_, err := sig.CertChain[0].Verify(opts)
+		if err != nil {
+			return fmt.Errorf("in signature %d, failed to verify certificate chain: %w", i, err)
+		}
+		verifiers = append(verifiers, cose.Verifier{
+			PublicKey: sig.CertChain[0].PublicKey,
+			Alg:       sig.Algorithm,
+		})
+	}
+
+	// Second, use the verifiers to check the cose signatures
+	msg.coseMsg.Payload = msg.Payload
+	err := msg.coseMsg.Verify(nil, verifiers)
+	if err != nil {
+		return fmt.Errorf("failed to verify COSE signatures: %w", err)
 	}
 	return nil
 }

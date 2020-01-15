@@ -28,7 +28,8 @@ func main() {
 	}
 	msg.SetPayload(signableInput)
 
-	// make 2 signatures
+	// make 2 chains of certs and preparing signatures using them
+	localCertPool := x509.NewCertPool()
 	for i := 1; i <= 2; i++ {
 		fmt.Printf("-- preparing signature %d\n", i)
 		eePriv, chain, err := makeCertChain()
@@ -39,6 +40,8 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		// we save the roots for verification later
+		localCertPool.AddCert(chain[len(chain)-1])
 	}
 	for i, tsServer := range []string{
 		"http://timestamp.digicert.com/",
@@ -88,7 +91,7 @@ func main() {
 	}
 	parsedMsg.SetPayload(signableInput)
 
-	// Verify the signature of the timestamp and the chain of certificate
+	// Verify the signatures of the timestamps and the chain of certificates
 	// against the roots stored in the system truststore.
 	systemCertPool, err := x509.SystemCertPool()
 	if err != nil {
@@ -98,11 +101,20 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("-- timestamps verified")
+	fmt.Println("-- timestamps verified")
+
+	// Verify the signatures of the messages using the local truststore we
+	// previously created
+	err = parsedMsg.VerifySignatures(localCertPool)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("-- signatures verified")
 }
 
+// helper that generates a certificate chain and returns it ordered from end-entity to root
 func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []*x509.Certificate, err error) {
-	rootKeyName := []byte(fmt.Sprintf("root%d", time.Now().Unix()))
+	rootKeyName := []byte(fmt.Sprintf("root%d", time.Now().UnixNano()))
 	rootPriv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
 		return
@@ -134,7 +146,7 @@ func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []*x509.Certificate, er
 		return
 	}
 
-	interKeyName := []byte(fmt.Sprintf("inter%d", time.Now().Unix()))
+	interKeyName := []byte(fmt.Sprintf("inter%d", time.Now().UnixNano()))
 	interPriv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
 		return
@@ -153,7 +165,7 @@ func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []*x509.Certificate, er
 		return
 	}
 
-	eeKeyName := []byte(fmt.Sprintf("endentity%d", time.Now().Unix()))
+	eeKeyName := []byte(fmt.Sprintf("endentity%d", time.Now().UnixNano()))
 	eePrivKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return
@@ -171,6 +183,6 @@ func makeCertChain() (eePrivKey *ecdsa.PrivateKey, chain []*x509.Certificate, er
 	if err != nil {
 		return
 	}
-	chain = []*x509.Certificate{rootCert, interCert, eeCert}
+	chain = []*x509.Certificate{eeCert, interCert, rootCert}
 	return
 }
