@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,21 +14,20 @@ import (
 	"time"
 
 	"go.mozilla.org/renard"
+	_ "go.mozilla.org/renard/zip"
 )
 
 func main() {
 	msg := renard.NewSignMessage()
-	msg.SetFileFormat(renard.Zip)
 	input, err := ioutil.ReadFile(os.Args[1])
 	if err != nil {
 		panic(err)
 	}
-	signableInput, err := renard.ExtractSignedSections(input)
+	buf := bytes.NewReader(input)
+	err = msg.ReadPayload(buf, renard.Zip)
 	if err != nil {
 		panic(err)
 	}
-	msg.SetPayload(signableInput)
-
 	// make 2 chains of certs and preparing signatures using them
 	localCertPool := x509.NewCertPool()
 	for i := 1; i <= 2; i++ {
@@ -43,6 +43,7 @@ func main() {
 		// we save the roots for verification later
 		localCertPool.AddCert(chain[len(chain)-1])
 	}
+	// request timestamps from two separate TSAs
 	for i, tsServer := range []string{
 		"http://timestamp.digicert.com/",
 		"http://timestamp.comodoca.com/",
@@ -58,26 +59,30 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("-- marshalling\n")
-	coseSig, err := msg.Marshal()
+	// write the output file to disk
+	fd, err := ioutil.TempFile("", "renard")
 	if err != nil {
 		panic(err)
 	}
-	tmpfile, err := ioutil.TempFile("", "coseSig")
+	err = msg.WritePayload(fd)
 	if err != nil {
 		panic(err)
 	}
-	if _, err := tmpfile.Write(coseSig); err != nil {
-		panic(err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		panic(err)
-	}
-	fmt.Printf("-- done. cose signature of len %d bytes written to %s\n", len(coseSig), tmpfile.Name())
+	fmt.Println("-- output file written to", fd.Name())
 
-	// Parse the cose message and verify timestamps and signatures
-	fmt.Println("-- unmarshalling")
-	parsedMsg, err := renard.Unmarshal(coseSig)
+	// Read back the signed file and verify
+	fmt.Println("-- reading back", fd.Name())
+	input2, err := ioutil.ReadFile(fd.Name())
+	if err != nil {
+		panic(err)
+	}
+	buf2 := bytes.NewReader(input2)
+	parsedMsg := renard.NewSignMessage()
+	err = parsedMsg.ReadPayload(buf2, renard.Zip)
+	if err != nil {
+		panic(err)
+	}
+	err = parsedMsg.ReadSignature(buf2, renard.Zip)
 	if err != nil {
 		panic(err)
 	}
@@ -89,7 +94,6 @@ func main() {
 			fmt.Printf("-- signature %d certificate %d %s\n", i, j, cert.Subject.CommonName)
 		}
 	}
-	parsedMsg.SetPayload(signableInput)
 
 	// Verify the signatures of the timestamps and the chain of certificates
 	// against the roots stored in the system truststore.
@@ -97,19 +101,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	err = parsedMsg.VerifyTimestamps(systemCertPool)
+	err = parsedMsg.Verify(systemCertPool, localCertPool)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("-- timestamps verified")
-
-	// Verify the signatures of the messages using the local truststore we
-	// previously created
-	err = parsedMsg.VerifySignatures(localCertPool)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("-- signatures verified")
+	fmt.Println("-- timestamps & signatures verified")
 }
 
 // helper that generates a certificate chain and returns it ordered from end-entity to root

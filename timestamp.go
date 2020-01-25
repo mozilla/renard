@@ -242,7 +242,7 @@ func verifyTimestamp(rawTs, payloadHash []byte, certpool *x509.CertPool) error {
 		return fmt.Errorf("timestamp response contains no hashed message")
 	}
 	if !bytes.Equal(inf.MessageImprint.HashedMessage, payloadHash) {
-		return fmt.Errorf("timestamp's hashes message %x doesn't match expected hash %x", inf.MessageImprint.HashedMessage, payloadHash)
+		return fmt.Errorf("timestamp hashed message %x doesn't match expected hash %x", inf.MessageImprint.HashedMessage, payloadHash)
 	}
 	return nil
 }

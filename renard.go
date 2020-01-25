@@ -27,6 +27,7 @@ truststore.
 package renard // import "go.mozilla.org/renard"
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -42,41 +43,9 @@ import (
 )
 
 const (
-	// SigningBlockMagic is the magic string “Renard Scheme v1” (16 bytes)
-	SigningBlockMagic = "Renard Scheme v1"
-
-	// ZipSig is the zip signature “RNR1” in little-endian
-	ZipSig = "\x4e\x52\x31\x52"
-
 	coseTimestampHeaderLabel = "timestamps"
 	coseX5ChainHeaderLabel   = "x5chain"
 )
-
-// FileFormat identifies a supported input file format
-type FileFormat uint
-
-// File formats are identified by a given constant
-const (
-	Zip FileFormat = 1 + iota // import go.mozilla.org/renard/fileformat/zip
-	Mar                       // import go.mozilla.org/renard/fileformat/mar
-)
-
-// SigningBlock is the block containing a signature
-// and its metadata that is inserted into a signed file
-type SigningBlock struct {
-
-	// The zip signature 0x4e523152 (“RNR1” in little-endian)
-	ZipSig []byte
-
-	// A marshalled COSE_Sign structure, of variable length
-	Sig []byte
-
-	// A uint64 representing the size in bytes of the COSE_Sign structure
-	MultiSigByteSize uint64
-
-	// The magic string “Renard Scheme v1” (16 bytes)
-	Magic string
-}
 
 // SignMessage is the document that contains signatures and timestamps
 // that protect a file. A user of the Renard scheme initializes a new
@@ -90,10 +59,13 @@ type SignMessage struct {
 	Signatures       []Signature
 	CounterSignature CounterSignature
 
-	coseMsg     *cose.SignMessage
-	isFinalized bool
-	fileFormat  FileFormat
-	rand        io.Reader // rand is a CSPRNG from crypto/rand (default) or set to a specific reader (like an hsm)
+	coseMsg      *cose.SignMessage
+	coseMsgBytes []byte
+	isFinalized  bool
+	fileFormat   FormatIdentifier
+	rand         io.Reader // rand is a CSPRNG from crypto/rand (default) or set to a specific reader (like an hsm)
+	signableData *bytes.Reader
+	encoder      Encoder
 }
 
 // A Signature is an authority-issued signature of the hash of the signed file
@@ -117,23 +89,10 @@ func NewSignMessage() *SignMessage {
 	return msg
 }
 
-// SetFileFormat tells the marshaller to use a specific file format
-// to insert and extract signature messages from files.
-func (msg *SignMessage) SetFileFormat(ff FileFormat) {
-	msg.fileFormat = ff
-}
-
 // SetRng configures the signers to use a different
 // random number generator than the default from crypto/rand
 func (msg *SignMessage) SetRng(rng io.Reader) {
 	msg.rand = rng
-}
-
-// SetPayload sets the payload of the sign message. Later on, finalization will hash this
-// payload alongside the protected headers and other metadata, then sign the results.
-// The Payload is normally set to the signed sections of a file.
-func (msg *SignMessage) SetPayload(payload []byte) {
-	msg.Payload = payload
 }
 
 // AddTimestamp adds a rfc3161 signed timestamp retrieved an authority
@@ -156,16 +115,6 @@ func (msg *SignMessage) AddTimestamp(server string) error {
 	}
 	msg.Timestamps = append(msg.Timestamps, *ts)
 	return nil
-}
-
-// ExtractSignedSections takes an input ZIP file and returns the sections
-// that needs to be hashed for signing. For fresh zip files, input and output
-// are identical. For ZIPs that already contain an AOS3 signing block, the
-// extraction will remove the signing block, restore the offset of the zip
-// central directory, and return the output.
-func ExtractSignedSections(input []byte) (output []byte, err error) {
-	// TODO: support already signed files
-	return input, nil
 }
 
 // PrepareSignature takes a private key and chain of certificates (ordered from end-entity to root)
@@ -253,10 +202,10 @@ func validateCertChain(chain []*x509.Certificate) error {
 	return nil
 }
 
-// Finalize signs a message with all the configured cose signers and makes
-// it ready for marshalling and insertion into the destination file.
+// Finalize signs a message with all the configured cose signers and encodes it
+// into a COSE_Sign object according to https://tools.ietf.org/html/rfc8152#section-4.1
 //
-// A finalized message can no longer be modified, except for counter signatures.
+// A finalized message can no longer be modified, but  counter signatures can still be added.
 func (msg *SignMessage) Finalize() (err error) {
 	if msg.isFinalized {
 		return fmt.Errorf("cannot finalize a message that's already finalized")
@@ -290,46 +239,41 @@ func (msg *SignMessage) Finalize() (err error) {
 
 	// the signature is detached so the payload is always empty
 	msg.coseMsg.Payload = nil
+	msg.coseMsgBytes, err = cose.Marshal(msg.coseMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cose message: %w", err)
+	}
 	msg.isFinalized = true
 	return nil
 }
 
-// Marshal encodes a finalized SignMessage into a COSE_Sign object
-// compliant with https://tools.ietf.org/html/rfc8152#section-4.1
-func (msg *SignMessage) Marshal() (coseSign []byte, err error) {
-	// preconditions
-	if !msg.isFinalized {
-		return nil, errors.New("message must be finalized before marshalling")
+// Parse parses a binary cose signature into a renard sign message.
+func (msg *SignMessage) ParseCoseSignMsg(coseMsg []byte) (err error) {
+	if msg.isFinalized {
+		return fmt.Errorf("message is already finalized and new cose signatures cannot be parsed into it")
 	}
-	return cose.Marshal(msg.coseMsg)
-}
-
-// Unmarshal parses a binary cose signature into a renard sign message.
-func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
-	msg = NewSignMessage()
-	msg.isFinalized = true
-	parsedMsg, err := cose.Unmarshal(coseMsg)
+	parsedCoseMsg, err := cose.Unmarshal(coseMsg)
 	if err != nil {
-		return msg, fmt.Errorf("failed to unmarshal cose message: %w", err)
+		return fmt.Errorf("failed to unmarshal cose message: %w", err)
 	}
-	cMsg := parsedMsg.(cose.SignMessage)
+	cMsg := parsedCoseMsg.(cose.SignMessage)
 	msg.coseMsg = &cMsg
 
 	// Parse the timestamps
 	if timestamps, ok := msg.coseMsg.Headers.Protected[coseTimestampHeaderLabel]; ok {
 		tsArray, ok := timestamps.([]interface{})
 		if !ok {
-			return msg, fmt.Errorf("failed to decode timestamps as an array")
+			return fmt.Errorf("failed to decode timestamps as an array")
 		}
 		for i, timestamp := range tsArray {
 			tsBytes, ok := timestamp.([]byte)
 			if !ok {
-				return msg, fmt.Errorf("failed to decode %d timestamp as a byte sequence", i)
+				return fmt.Errorf("failed to decode %d timestamp as a byte sequence", i)
 			}
 			// timestamp header found, parse them
 			parsedTs, err := parseTimestamp(tsBytes)
 			if err != nil {
-				return msg, fmt.Errorf("failed to parse timestamps: %w", err)
+				return fmt.Errorf("failed to parse timestamps: %w", err)
 			}
 			msg.Timestamps = append(msg.Timestamps, *parsedTs)
 		}
@@ -340,10 +284,10 @@ func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
 		var sig Signature
 		algValue, ok := coseSig.Headers.Protected[cose.GetCommonHeaderTagOrPanic("alg")]
 		if !ok {
-			return msg, fmt.Errorf("missing 'alg' protected header in cose signature %d, cannot determine signing algorithm", i)
+			return fmt.Errorf("missing 'alg' protected header in cose signature %d, cannot determine signing algorithm", i)
 		}
 		if _, ok = algValue.(int); !ok {
-			return msg, fmt.Errorf("in signature %d, 'alg' protected header is invalid, cannot determine signing algorithm", i)
+			return fmt.Errorf("in signature %d, 'alg' protected header is invalid, cannot determine signing algorithm", i)
 		}
 		switch algValue {
 		case cose.PS256.Value:
@@ -353,30 +297,31 @@ func Unmarshal(coseMsg []byte) (msg *SignMessage, err error) {
 		case cose.ES384.Value:
 			sig.Algorithm = cose.ES384
 		default:
-			return msg, fmt.Errorf("in signature %d, 'alg' header value %d doesn't match any known algorithm", i, algValue)
+			return fmt.Errorf("in signature %d, 'alg' header value %d doesn't match any known algorithm", i, algValue)
 		}
 		derCerts, ok := coseSig.Headers.Protected[coseX5ChainHeaderLabel]
 		if !ok {
-			return msg, fmt.Errorf("missing 'x5chain' protected header in cose signature %d, cannot access certificate chain", i)
+			return fmt.Errorf("missing 'x5chain' protected header in cose signature %d, cannot access certificate chain", i)
 		}
 		if _, ok = derCerts.([]interface{}); !ok {
-			return msg, fmt.Errorf("in signature %d, 'x5chain' protected header is not an array, cannot extract certificate chain", i)
+			return fmt.Errorf("in signature %d, 'x5chain' protected header is not an array, cannot extract certificate chain", i)
 		}
 		var derChain []byte
 		for j, cert := range derCerts.([]interface{}) {
 			derCert, ok := cert.([]byte)
 			if !ok {
-				return msg, fmt.Errorf("in signature %d, certificate %d is not in DER form", i, j)
+				return fmt.Errorf("in signature %d, certificate %d is not in DER form", i, j)
 			}
 			derChain = append(derChain, derCert...)
 		}
 		sig.CertChain, err = x509.ParseCertificates(derChain)
 		if err != nil {
-			return msg, fmt.Errorf("in signature %d, failed to parse DER certificate chain: %w", i, err)
+			return fmt.Errorf("in signature %d, failed to parse DER certificate chain: %w", i, err)
 		}
 		sig.coseSig = &coseSig
 		msg.Signatures = append(msg.Signatures, sig)
 	}
+	msg.isFinalized = true
 	return
 }
 
@@ -426,6 +371,9 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 		verificationTime = msg.Timestamps[0].Time
 	}
 	for i, sig := range msg.Signatures {
+		if len(sig.CertChain) == 0 {
+			return fmt.Errorf("empty certificate chain in signature %d", i)
+		}
 		inters := x509.NewCertPool()
 		opts := x509.VerifyOptions{
 			Roots:         localRoots,
