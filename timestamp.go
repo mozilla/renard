@@ -16,6 +16,15 @@ import (
 	"go.mozilla.org/pkcs7"
 )
 
+// WellKnownTSA is a list of publicly accessible timestamp authorities
+var WellKnownTSA = []string{
+	"http://timestamp.digicert.com/",
+	"http://timestamp.comodoca.com/",
+	`http://sha256timestamp.ws.symantec.com/sha256/timestamp`,
+	`http://timestamp.globalsign.com/scripts/timstamp.dll`,
+	`http://time.certum.pl`,
+}
+
 // Timestamp represents a Signed Timestamp issued by a
 // TimeStamp Authority (TSA) according to
 // https://tools.ietf.org/html/rfc3161#section-2.4.1

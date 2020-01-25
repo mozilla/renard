@@ -44,10 +44,7 @@ func main() {
 		localCertPool.AddCert(chain[len(chain)-1])
 	}
 	// request timestamps from two separate TSAs
-	for i, tsServer := range []string{
-		"http://timestamp.digicert.com/",
-		"http://timestamp.comodoca.com/",
-	} {
+	for i, tsServer := range renard.WellKnownTSA {
 		fmt.Printf("-- requesting timestamp %d from %q\n", i, tsServer)
 		err = msg.AddTimestamp(tsServer)
 		if err != nil {
