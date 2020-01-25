@@ -43,8 +43,12 @@ import (
 )
 
 const (
-	coseTimestampHeaderLabel = "timestamps"
-	coseX5ChainHeaderLabel   = "x5chain"
+	// timestamp cose header allocated in private range
+	coseTimestampHeaderLabel = -718357482
+
+	// x5chain cose header registered at
+	// https://www.iana.org/assignments/cose/cose.xhtml#header-parameters
+	coseX5ChainHeaderLabel = 33
 )
 
 // SignMessage is the document that contains signatures and timestamps
