@@ -1,0 +1,14 @@
+version: 2
+jobs:
+  test:
+    docker:
+      - image: circleci/golang:1.13
+    steps:
+      - checkout
+      - run: wget https://addons.mozilla.org/firefox/downloads/file/3452970/ublock_origin-1.24.2-an+fx.xpi
+      - run: go run cmd/sign/main.go ublock_origin-1.24.2-an+fx.xpi
+workflows:
+  version: 2
+  test:
+    jobs:
+      - test
