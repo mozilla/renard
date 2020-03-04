@@ -36,26 +36,19 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		err = msg.PrepareSignature(eePriv, chain)
+		err = msg.AddSignature(eePriv, chain, renard.WellKnownTSA[0:2])
 		if err != nil {
 			panic(err)
 		}
 		// we save the roots for verification later
 		localCertPool.AddCert(chain[len(chain)-1])
 	}
-	// request timestamps from two separate TSAs
-	for i, tsServer := range renard.WellKnownTSA {
-		fmt.Printf("-- requesting timestamp %d from %q\n", i, tsServer)
-		err = msg.AddTimestamp(tsServer)
-		if err != nil {
-			panic(err)
-		}
-	}
-	fmt.Printf("-- signing and finalizing\n")
+	fmt.Printf("-- signing, timestamping, marshalling\n")
 	err = msg.Finalize()
 	if err != nil {
 		panic(err)
 	}
+
 	// write the output file to disk
 	fd, err := ioutil.TempFile("", "renard")
 	if err != nil {
@@ -75,20 +68,23 @@ func main() {
 	}
 	buf2 := bytes.NewReader(input2)
 	parsedMsg := renard.NewSignMessage()
+	fmt.Println("-- reading payload")
 	err = parsedMsg.ReadPayload(buf2, renard.Zip)
 	if err != nil {
 		panic(err)
 	}
+	fmt.Println("-- reading signatures")
 	err = parsedMsg.ReadSignature(buf2, renard.Zip)
 	if err != nil {
 		panic(err)
 	}
-	for i, ts := range parsedMsg.Timestamps {
-		fmt.Printf("-- found timestamp %d from %q\n", i, ts.Certificates[0].Issuer.CommonName)
-	}
+
 	for i, sig := range parsedMsg.Signatures {
+		for j, ts := range sig.Timestamps {
+			fmt.Printf("-- in signature %d found timestamp %d from %q\n", i, j, ts.Certificates[0].Issuer.CommonName)
+		}
 		for j, cert := range sig.CertChain {
-			fmt.Printf("-- signature %d certificate %d %s\n", i, j, cert.Subject.CommonName)
+			fmt.Printf("-- in signature %d certificate %d %s\n", i, j, cert.Subject.CommonName)
 		}
 	}
 

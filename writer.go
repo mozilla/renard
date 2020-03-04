@@ -46,12 +46,12 @@ func (msg *SignMessage) ReadSignature(buf *bytes.Reader, ff FormatIdentifier) (e
 	if msg.encoder == nil {
 		msg.encoder, err = AvailableEncoders[msg.fileFormat].NewEncoder(buf)
 		if err != nil {
-			return
+			return fmt.Errorf("failed to make new encoder: %w", err)
 		}
 	}
 	coseMsgBytes, err := msg.encoder.DecodeSignature()
 	if err != nil {
-		return
+		return fmt.Errorf("failed to decode signature: %w", err)
 	}
 	return msg.ParseCoseSignMsg(coseMsgBytes)
 }

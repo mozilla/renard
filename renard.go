@@ -1,6 +1,6 @@
-/*Package renard implements the RENARD signature scheme
+/*Package renard implements the RENARD signature format
 
-Renard (RNR) is a signature scheme designed to provide strong integrity
+Renard (RNR) is a signature format designed to provide strong integrity
 guarantees on files. It is based on COSE and developed for Firefox add-ons
 (web extensions) and updates.
 
@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"go.mozilla.org/cose"
@@ -52,32 +53,34 @@ const (
 )
 
 // SignMessage is the document that contains signatures and timestamps
-// that protect a file. A user of the Renard scheme initializes a new
+// that protect a file. A user of the Renard format initializes a new
 // SignMessage, populates it, then inserts it into a file according to
 // its format. The raw representation of a SignMessage follows the
 // COSE_Sign specification from rfc8152.
 type SignMessage struct {
 	Hashes           map[crypto.Hash][]byte // hashes of signable data indexed by hash algorithm
-	Timestamps       []Timestamp            // array of rfc3161 timestamps
 	Payload          []byte
 	Signatures       []Signature
 	CounterSignature CounterSignature
 
-	coseMsg      *cose.SignMessage
-	coseMsgBytes []byte
-	isFinalized  bool
-	fileFormat   FormatIdentifier
-	rand         io.Reader // rand is a CSPRNG from crypto/rand (default) or set to a specific reader (like an hsm)
-	signableData *bytes.Reader
-	encoder      Encoder
+	coseMsg                             *cose.SignMessage
+	coseMsgBytes                        []byte
+	hasFinalizedSignatures, isFinalized bool
+	fileFormat                          FormatIdentifier
+	rand                                io.Reader // rand is a CSPRNG from crypto/rand (default) or set to a specific reader (like an hsm)
+	signableData                        *bytes.Reader
+	encoder                             Encoder
 }
 
 // A Signature is an authority-issued signature of the hash of the signed file
 type Signature struct {
-	Algorithm *cose.Algorithm
-	CertChain []*x509.Certificate
-	coseSig   *cose.Signature
-	signer    *cose.Signer
+	Algorithm      *cose.Algorithm
+	CertChain      []*x509.Certificate
+	Timestamps     []Timestamp // array of rfc3161 timestamps
+	SignatureBytes []byte
+	coseSig        *cose.Signature
+	signer         *cose.Signer
+	tsaServers     []string
 }
 
 // CounterSignature is an optional signature that can be applied
@@ -99,37 +102,18 @@ func (msg *SignMessage) SetRng(rng io.Reader) {
 	msg.rand = rng
 }
 
-// AddTimestamp adds a rfc3161 signed timestamp retrieved an authority
-// to a SignMessage.
-//
-// You can use any compliant public authority, such as
-// http://timestamp.digicert.com or http://timestamp.comodoca.com/, as long
-// as their roots are trusted by the system.
-func (msg *SignMessage) AddTimestamp(server string) error {
-	if msg.isFinalized {
-		return errors.New("message is already finalized, adding timestamps is not possible as it breaks signatures")
-	}
-	if msg.Payload == nil {
-		return errors.New("message payload is not set")
-	}
-	h256 := sha256.Sum256(msg.Payload)
-	ts, err := requestTimestampFromTSA(server, h256[:], crypto.SHA256)
-	if err != nil {
-		return fmt.Errorf("failed to request timestamp from tsa: %w", err)
-	}
-	msg.Timestamps = append(msg.Timestamps, *ts)
-	return nil
-}
-
-// PrepareSignature takes a private key and chain of certificates (ordered from end-entity to root)
-// and prepares a signature that will sign the message when finalized.
+// PrepareSignature takes a private key, chain of certificates (ordered from end-entity to root)
+// and a list of timestamping authority servers, then prepares a signature that will sign and
+// timestamp the message when finalized.
 //
 // While this function takes a full chain, for verification purpose, the root certificate
 // is not included in the final signature and is assumed to be known to verifiers.
 //
 // The signing algorithm is determined by the key type. RSA keys get PS256, ECDSA
 // keys get ES256 for P-256 and ES384 for P-384. No other curves are supported.
-func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Certificate) (err error) {
+//
+// A list of valid and trusted TSA servers is kept in WellKnownTSA.
+func (msg *SignMessage) AddSignature(signer crypto.Signer, chain []*x509.Certificate, tsaServers []string) (err error) {
 	if msg.isFinalized {
 		return errors.New("message is already finalized, adding signers is not permitted")
 	}
@@ -138,6 +122,13 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Cer
 	}
 	var sig Signature
 	sig.coseSig = cose.NewSignature()
+
+	// store the list of TSA servers to be used for timestamping
+	// once signatures are issued. This is done when finalizing.
+	if len(tsaServers) == 0 {
+		return fmt.Errorf("at least one tsa server is required for timestamping")
+	}
+	sig.tsaServers = tsaServers
 
 	// find out the cose algorithm based on the priv key type
 	switch signer.Public().(type) {
@@ -156,6 +147,9 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Cer
 		return fmt.Errorf("unsupported key type %t", signer.Public())
 	}
 	sig.coseSig.Headers.Protected["alg"] = sig.Algorithm.Name
+
+	// initialize an empty array for future timestamps in the unprotected headers
+	sig.coseSig.Headers.Unprotected[coseTimestampHeaderLabel] = [][]byte{}
 
 	// make sure the certificate chain is properly constructed,
 	err = validateCertChain(chain)
@@ -177,6 +171,9 @@ func (msg *SignMessage) PrepareSignature(signer crypto.Signer, chain []*x509.Cer
 	return nil
 }
 
+// validateCertChain checks that a provided chain of x509 certificates
+// verifies itself and is properly ordered from end-entity to
+// intermediate to root.
 func validateCertChain(chain []*x509.Certificate) error {
 	if len(chain) < 2 {
 		return errors.New("certificate chain cannot have less than 2 certificates (an end-entity and a root)")
@@ -206,10 +203,9 @@ func validateCertChain(chain []*x509.Certificate) error {
 	return nil
 }
 
-// Finalize signs a message with all the configured cose signers and encodes it
-// into a COSE_Sign object according to https://tools.ietf.org/html/rfc8152#section-4.1
-//
-// A finalized message can no longer be modified, but  counter signatures can still be added.
+// Finalize performs the signature process with all the configured cose signers,
+// issues timestamps on all of the signatures, then marshals the signature message
+// into a COSE message ready for writing to an output.
 func (msg *SignMessage) Finalize() (err error) {
 	if msg.isFinalized {
 		return fmt.Errorf("cannot finalize a message that's already finalized")
@@ -226,23 +222,20 @@ func (msg *SignMessage) Finalize() (err error) {
 		msg.coseMsg.AddSignature(sig.coseSig)
 		signers = append(signers, *sig.signer)
 	}
-
-	// add the timestamps to the top-level headers of the cose signmessage
-	if len(msg.Timestamps) > 0 {
-		var timestamps [][]byte
-		for _, ts := range msg.Timestamps {
-			timestamps = append(timestamps, ts.Raw)
-		}
-		msg.coseMsg.Headers.Protected[coseTimestampHeaderLabel] = timestamps
-	}
-
-	err = msg.coseMsg.Sign(msg.rand, nil, signers)
-	if err != nil {
-		return fmt.Errorf("failed to sign final message: %w", err)
-	}
-
 	// the signature is detached so the payload is always empty
 	msg.coseMsg.Payload = nil
+	err = msg.coseMsg.Sign(msg.rand, nil, signers)
+	if err != nil {
+		return fmt.Errorf("failed to compute cose signatures: %w", err)
+	}
+	// store cose signature bytes into the parsed struct
+	for i := range msg.Signatures {
+		msg.Signatures[i].SignatureBytes = msg.coseMsg.Signatures[i].SignatureBytes
+	}
+	err = msg.timestampSignatures()
+	if err != nil {
+		return fmt.Errorf("failed to timestamp signatures: %w", err)
+	}
 	msg.coseMsgBytes, err = cose.Marshal(msg.coseMsg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal cose message: %w", err)
@@ -251,7 +244,29 @@ func (msg *SignMessage) Finalize() (err error) {
 	return nil
 }
 
-// Parse parses a binary cose signature into a renard sign message.
+// timestampSignatures adds a rfc3161 signed timestamp
+// to each Cose signatures existing on a message. The message must have
+// finalized signatures prior to calling this function.
+func (msg *SignMessage) timestampSignatures() error {
+	for i, sig := range msg.Signatures {
+		h256 := sha256.Sum256(sig.SignatureBytes)
+		for _, tsaServer := range sig.tsaServers {
+			ts, err := requestTimestampFromTSA(tsaServer, h256[:], crypto.SHA256)
+			if err != nil {
+				return fmt.Errorf("failed to request timestamp from tsa %q: %w", tsaServer, err)
+			}
+			msg.Signatures[i].Timestamps = append(msg.Signatures[i].Timestamps, *ts)
+		}
+		var rawTimestamps [][]byte
+		for _, timestamp := range msg.Signatures[i].Timestamps {
+			rawTimestamps = append(rawTimestamps, timestamp.Raw)
+		}
+		msg.coseMsg.Signatures[i].Headers.Unprotected[coseTimestampHeaderLabel] = rawTimestamps
+	}
+	return nil
+}
+
+// ParseCoseSignMsg parses a binary cose signature into a renard sign message.
 func (msg *SignMessage) ParseCoseSignMsg(coseMsg []byte) (err error) {
 	if msg.isFinalized {
 		return fmt.Errorf("message is already finalized and new cose signatures cannot be parsed into it")
@@ -263,29 +278,12 @@ func (msg *SignMessage) ParseCoseSignMsg(coseMsg []byte) (err error) {
 	cMsg := parsedCoseMsg.(cose.SignMessage)
 	msg.coseMsg = &cMsg
 
-	// Parse the timestamps
-	if timestamps, ok := msg.coseMsg.Headers.Protected[coseTimestampHeaderLabel]; ok {
-		tsArray, ok := timestamps.([]interface{})
-		if !ok {
-			return fmt.Errorf("failed to decode timestamps as an array")
-		}
-		for i, timestamp := range tsArray {
-			tsBytes, ok := timestamp.([]byte)
-			if !ok {
-				return fmt.Errorf("failed to decode %d timestamp as a byte sequence", i)
-			}
-			// timestamp header found, parse them
-			parsedTs, err := parseTimestamp(tsBytes)
-			if err != nil {
-				return fmt.Errorf("failed to parse timestamps: %w", err)
-			}
-			msg.Timestamps = append(msg.Timestamps, *parsedTs)
-		}
-	}
-
 	// Parse the signatures
 	for i, coseSig := range msg.coseMsg.Signatures {
-		var sig Signature
+		sig := Signature{
+			coseSig:        &coseSig,
+			SignatureBytes: coseSig.SignatureBytes,
+		}
 		algValue, ok := coseSig.Headers.Protected[cose.GetCommonHeaderTagOrPanic("alg")]
 		if !ok {
 			return fmt.Errorf("missing 'alg' protected header in cose signature %d, cannot determine signing algorithm", i)
@@ -322,44 +320,44 @@ func (msg *SignMessage) ParseCoseSignMsg(coseMsg []byte) (err error) {
 		if err != nil {
 			return fmt.Errorf("in signature %d, failed to parse DER certificate chain: %w", i, err)
 		}
-		sig.coseSig = &coseSig
+		// Parse the timestamps
+		if _, ok := sig.coseSig.Headers.Unprotected[coseTimestampHeaderLabel]; !ok {
+			return fmt.Errorf("no timestamps found in signature %d", i)
+		}
+		tsArray, ok := sig.coseSig.Headers.Unprotected[coseTimestampHeaderLabel].([]interface{})
+		if !ok {
+			return fmt.Errorf("in signature %d, failed to decode timestamps as an array", i)
+		}
+		for j, timestamp := range tsArray {
+			tsBytes, ok := timestamp.([]byte)
+			if !ok {
+				return fmt.Errorf("in signature %d, failed to decode timestamp %d as a byte sequence", i, j)
+			}
+			// timestamp header found, parse them
+			parsedTs, err := parseTimestamp(tsBytes)
+			if err != nil {
+				return fmt.Errorf("in signature %d, failed to parse timestamps %d: %w", i, j, err)
+			}
+			sig.Timestamps = append(sig.Timestamps, *parsedTs)
+		}
 		msg.Signatures = append(msg.Signatures, sig)
 	}
 	msg.isFinalized = true
 	return
 }
 
-// VerifyTimestamps verify all the signed timestamps stored in a SignMessage
-// by chaining their certs to a truststore in argument, and verifying the
-// hash of the message payload matches the hash message in the timestamp.
-func (msg *SignMessage) VerifyTimestamps(certpool *x509.CertPool) error {
-	if !msg.isFinalized {
-		return errors.New("message is not finalized, cannot verify timestamps")
-	}
-	if msg.Payload == nil {
-		return errors.New("message payload is not set, cannot verify timestamps")
-	}
-	h256 := sha256.Sum256(msg.Payload)
-	for i, ts := range msg.Timestamps {
-		err := verifyTimestamp(ts.Raw, h256[:], certpool)
-		if err != nil {
-			return fmt.Errorf("timestamp %d failed verification: %w", i, err)
-		}
-	}
-	return nil
-}
-
-// VerifySignatures verifies each of the signatures stored in a SignMessage
+// Verify verifies each of the signatures stored in a SignMessage
 // and makes sure the certificates chain to roots in the provided truststore.
 //
-// Certificate expiration is checked based on the time of issuance of the
-// first signed timestamp listed in the SignMessage, not based on the current
-// time. In practice, it means signatures are considered valid as long as
-// certificates were valid at the time of issuance of the signature.
+// Signed timestamps in each signature are first verified, then certificates checked
+// against a provided tsaPool. The SHA256 hash of the signature byte used as the
+// timestamp payload.
 //
-// If no timestamps are available, certificate expiration is evaluated on
-// current time.
-func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
+// Signatures are then verified. Certificate expiration is checked based on the time
+// of issuance of the last signed timestamp listed in the SignMessage.
+// In practice, it means signatures are considered valid as long as
+// certificates were valid at the time of issuance of the signature.
+func (msg *SignMessage) Verify(tsaPool, localRoots *x509.CertPool) error {
 	if !msg.isFinalized {
 		return errors.New("message is not finalized, cannot verify signatures")
 	}
@@ -368,13 +366,24 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 	}
 	var verifiers = []cose.Verifier{}
 
-	// First verify the certificate chains on each of the signatures, and while
-	// doing so, store the public key of each end-entity into a list of verifiers
-	verificationTime := time.Now()
-	if len(msg.Timestamps) > 0 {
-		verificationTime = msg.Timestamps[0].Time
-	}
 	for i, sig := range msg.Signatures {
+		var verificationTime time.Time
+		// verify timestamps
+		h256 := sha256.Sum256(sig.SignatureBytes)
+		hasValidTimestamp := false
+		for j, ts := range sig.Timestamps {
+			err := verifyTimestamp(ts.Raw, h256[:], tsaPool)
+			if err != nil {
+				// if timestamp verification fails, log and continue
+				fmt.Fprintf(os.Stderr, "warning: in signature %d, timestamp %d failed verification: %w", i, j, err)
+				continue
+			}
+			verificationTime = ts.Time
+			hasValidTimestamp = true
+		}
+		if !hasValidTimestamp {
+			return fmt.Errorf("no trusted timestamp could be found")
+		}
 		if len(sig.CertChain) == 0 {
 			return fmt.Errorf("empty certificate chain in signature %d", i)
 		}
@@ -388,8 +397,8 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 		if len(sig.CertChain) > 1 {
 			// for chains greater than 1, add all intermediates to
 			// the intermediate certpool in the verify options
-			for i := 1; i < len(sig.CertChain); i++ {
-				opts.Intermediates.AddCert(sig.CertChain[i])
+			for j := 1; j < len(sig.CertChain); j++ {
+				opts.Intermediates.AddCert(sig.CertChain[j])
 			}
 		}
 		// the first cert is the end-entity, start there to verify the chain
@@ -397,12 +406,12 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 		if err != nil {
 			return fmt.Errorf("in signature %d, failed to verify certificate chain: %w", i, err)
 		}
+		// now that the chain is verified, add the signature to a cose verifier
 		verifiers = append(verifiers, cose.Verifier{
 			PublicKey: sig.CertChain[0].PublicKey,
 			Alg:       sig.Algorithm,
 		})
 	}
-
 	// Second, use the verifiers to check the cose signatures
 	msg.coseMsg.Payload = msg.Payload
 	err := msg.coseMsg.Verify(nil, verifiers)
@@ -410,15 +419,4 @@ func (msg *SignMessage) VerifySignatures(localRoots *x509.CertPool) error {
 		return fmt.Errorf("failed to verify COSE signatures: %w", err)
 	}
 	return nil
-}
-
-// Verify handles the entire timestamp and signature verification logic. It first calls
-// VerifyTimestamp and passes it the timestampTrustStore, then calls VerifySignatures and
-// passes it the signaturesTrustStore.
-func (msg *SignMessage) Verify(timestampTrustStore, signaturesTrustStore *x509.CertPool) error {
-	err := msg.VerifyTimestamps(timestampTrustStore)
-	if err != nil {
-		return err
-	}
-	return msg.VerifySignatures(signaturesTrustStore)
 }

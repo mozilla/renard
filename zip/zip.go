@@ -35,8 +35,8 @@ type encoder struct {
 }
 
 const (
-	// SigningBlockMagic is the magic string “Renard Scheme v1” (16 bytes)
-	SigningBlockMagic    = "Renard Scheme v1"
+	// SigningBlockMagic is the magic string “Renard Format v1” (16 bytes)
+	SigningBlockMagic    = "Renard Format v1"
 	signingBlockMagicLen = 16
 
 	// ZipSig is the zip signature “RNR1”
@@ -133,7 +133,7 @@ func (e *encoder) DecodeSignedSections() (*bytes.Reader, error) {
 }
 
 // EncodeTo encodes a file payload and its signature according to the ZIP specification
-// of the Renard signing scheme.
+// of the Renard signing format.
 // A signature block is created containing, in that order:
 // - Zip signature
 // - Cose signature bytes
