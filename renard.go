@@ -102,7 +102,7 @@ func (msg *SignMessage) SetRng(rng io.Reader) {
 	msg.rand = rng
 }
 
-// PrepareSignature takes a private key, chain of certificates (ordered from end-entity to root)
+// AddSignature takes a private key, chain of certificates (ordered from end-entity to root)
 // and a list of timestamping authority servers, then prepares a signature that will sign and
 // timestamp the message when finalized.
 //
@@ -147,9 +147,6 @@ func (msg *SignMessage) AddSignature(signer crypto.Signer, chain []*x509.Certifi
 		return fmt.Errorf("unsupported key type %t", signer.Public())
 	}
 	sig.coseSig.Headers.Protected["alg"] = sig.Algorithm.Name
-
-	// initialize an empty array for future timestamps in the unprotected headers
-	sig.coseSig.Headers.Unprotected[coseTimestampHeaderLabel] = [][]byte{}
 
 	// make sure the certificate chain is properly constructed,
 	err = validateCertChain(chain)
@@ -222,12 +219,13 @@ func (msg *SignMessage) Finalize() (err error) {
 		msg.coseMsg.AddSignature(sig.coseSig)
 		signers = append(signers, *sig.signer)
 	}
-	// the signature is detached so the payload is always empty
-	msg.coseMsg.Payload = nil
 	err = msg.coseMsg.Sign(msg.rand, nil, signers)
 	if err != nil {
 		return fmt.Errorf("failed to compute cose signatures: %w", err)
 	}
+	// the signature is detached so the payload is always empty
+	msg.coseMsg.Payload = nil
+
 	// store cose signature bytes into the parsed struct
 	for i := range msg.Signatures {
 		msg.Signatures[i].SignatureBytes = msg.coseMsg.Signatures[i].SignatureBytes
@@ -245,10 +243,10 @@ func (msg *SignMessage) Finalize() (err error) {
 }
 
 // timestampSignatures adds a rfc3161 signed timestamp
-// to each Cose signatures existing on a message. The message must have
-// finalized signatures prior to calling this function.
+// to each Cose signatures existing on a message.
 func (msg *SignMessage) timestampSignatures() error {
 	for i, sig := range msg.Signatures {
+		// take the hash of the signature bytes as the timestamp payload
 		h256 := sha256.Sum256(sig.SignatureBytes)
 		for _, tsaServer := range sig.tsaServers {
 			ts, err := requestTimestampFromTSA(tsaServer, h256[:], crypto.SHA256)

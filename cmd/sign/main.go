@@ -30,12 +30,12 @@ func main() {
 	}
 	// make 2 chains of certs and preparing signatures using them
 	localCertPool := x509.NewCertPool()
-	for i := 1; i <= 2; i++ {
-		fmt.Printf("-- preparing signature %d\n", i)
+	for i := 0; i < 2; i++ {
 		eePriv, chain, err := makeCertChain()
 		if err != nil {
 			panic(err)
 		}
+		fmt.Printf("-- preparing signature %d with ee cert %s\n", i, chain[0].Subject.CommonName)
 		err = msg.AddSignature(eePriv, chain, renard.WellKnownTSA[0:2])
 		if err != nil {
 			panic(err)
